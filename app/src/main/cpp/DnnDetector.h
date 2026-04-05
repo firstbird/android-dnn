@@ -6,9 +6,17 @@
 #include <string>
 #include <vector>
 
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <condition_variable>
+
 // YOLOv5 ONNX：推理后在 RGBA 帧上绘制框与 COCO 英文标签（与 GL 纹理一致，避免线框错位）
 class DnnDetector {
 public:
+    DnnDetector();
+    ~DnnDetector();
+
     bool loadModel(const std::string& onnxPath);
     bool isLoaded() const { return loaded_; }
 
@@ -21,17 +29,25 @@ private:
         int padTop = 0;
     };
 
+    void inferenceLoop();
     static cv::Mat letterbox(const cv::Mat& bgr, int targetSize, Letterbox& lb);
     void drawLabelsRgba(cv::Mat& rgba, const std::vector<cv::Rect2d>& boxes,
                         const std::vector<int>& classIds, const std::vector<float>& confs);
 
     cv::dnn::Net net_;
-    bool loaded_ = false;
+    std::atomic<bool> loaded_{false};
     int inputSize_ = 640;
     float confThresh_ = 0.35f;
     float nmsThresh_ = 0.45f;
-    int frameCounter_ = 0;
-    int inferEveryN_ = 2;
+
+    std::thread workerThread_;
+    std::atomic<bool> running_{false};
+    std::mutex mtx_;
+    std::condition_variable cv_;
+
+    cv::Mat pendingFrame_;
+    bool hasNewFrame_ = false;
+
     std::vector<cv::Rect2d> lastBoxes_;
     std::vector<int> lastClassIds_;
     std::vector<float> lastConfs_;

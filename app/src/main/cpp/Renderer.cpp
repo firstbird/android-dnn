@@ -13,28 +13,49 @@
 // 将背景设为红色进行调试，如果看到红色说明 GL 工作正常
 #define DEBUG_RED 1.0f, 0.0f, 0.0f, 1
 
+// 顶点着色器：每个顶点运行一次，决定顶点在屏幕上的位置，并把「纹理坐标」传给片元着色器
 static const char *cameraVertex = R"vertex(#version 300 es
-in vec3 inPosition;
-in vec2 inUV;
-uniform mat4 uProjection;
+// OpenGL ES 3.0 着色语言版本（与 GLES3 上下文一致）
+
+// 顶点属性：由 C++ 里 VBO + glVertexAttribPointer 传入
+in vec3 inPosition;   // 顶点位置（本工程里是经投影后的裁剪空间附近坐标）
+in vec2 inUV;         // 顶点对应的纹理坐标 (0~1)，用于在相机纹理上取样
+
+// uniform：整张画面共用一个值的变量，由 C++ 的 glUniform* 设置
+uniform mat4 uProjection; // 旋转等变换矩阵，把 inPosition 变到最终位置
+
+// out：输出给「片元着色器」的同名 in（这里是插值后的 fragUV）
 out vec2 fragUV;
+
 void main() {
+    // 把当前顶点的 UV 原样交给后面；三角形内部的像素会得到插值后的 UV
     fragUV = inUV;
+    // gl_Position 必须是 vec4，固定表示该顶点在裁剪空间的位置（GPU 再自己做透视除法、视口变换）
     gl_Position = uProjection * vec4(inPosition, 1.0);
 }
 )vertex";
 
+// 片元着色器：每个像素（片元）运行一次，决定最终颜色（这里 = 相机纹理取样结果）
 static const char *cameraFragment = R"fragment(#version 300 es
+// 浮点纹理采样的精度（mediump 在手机上够用且较快）
 precision mediump float;
+
+// 与顶点着色器里的 out vec2 fragUV 对应（在三角形内会自动插值）
 in vec2 fragUV;
-uniform sampler2D uTexture;
-// x/y 为 0 或 1：1 时在对应轴镜像（横竖屏在 CPU 侧区分）
+
+uniform sampler2D uTexture; // 绑定到纹理单元上的相机画面（RGBA）
+
+// 由 C++ 传入 (0或1, 0或1)：为 1 时在对应轴做镜像，修正竖屏预览方向/后置镜像
 uniform vec2 uTexFlip;
-out vec4 outColor;
+
+out vec4 outColor; // 输出到帧缓冲的颜色 (RGBA)
+
 void main() {
+    // mix(a, b, t) = a*(1-t)+b*t：t 为 0 保持原 UV，为 1 则变成 1-uv，即沿该轴翻转取样
     vec2 uv = vec2(
         mix(fragUV.x, 1.0 - fragUV.x, uTexFlip.x),
         mix(fragUV.y, 1.0 - fragUV.y, uTexFlip.y));
+    // 用 uv 在相机纹理上取颜色，作为该像素最终颜色
     outColor = texture(uTexture, uv);
 }
 )fragment";
