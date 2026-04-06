@@ -13,25 +13,64 @@
 // 将背景设为红色进行调试，如果看到红色说明 GL 工作正常
 #define DEBUG_RED 1.0f, 0.0f, 0.0f, 1
 
+namespace {
+
+// 列主序 4x4
+void identityMat4(float m[16]) {
+    for (int i = 0; i < 16; ++i) {
+        m[i] = 0.f;
+    }
+    m[0] = m[5] = m[10] = m[15] = 1.f;
+}
+
+void scaleMat4(float m[16], float sx, float sy, float sz) {
+    identityMat4(m);
+    m[0] = sx;
+    m[5] = sy;
+    m[10] = sz;
+}
+
+// 单位四边形顶点 ±1，经 M = T(cx,cy,tz) * S(hw,hh,1) 得到原先 x±w, y±h, z=tz
+/*
+halfW 0    0 cx
+0    halfH 0 cy
+0     0    1 tz
+0     0    0 1
+
+*/
+
+void modelBoxMat4(float m[16], float cx, float cy, float tz, float halfW, float halfH) {
+    for (int i = 0; i < 16; ++i) {
+        m[i] = 0.f;
+    }
+    m[0] = halfW;
+    m[5] = halfH;
+    m[10] = 1.f;
+    m[12] = cx;
+    m[13] = cy;
+    m[14] = tz;
+    m[15] = 1.f;
+}
+
+} // namespace
+
 // 顶点着色器：每个顶点运行一次，决定顶点在屏幕上的位置，并把「纹理坐标」传给片元着色器
 static const char *cameraVertex = R"vertex(#version 300 es
 // OpenGL ES 3.0 着色语言版本（与 GLES3 上下文一致）
 
-// 顶点属性：由 C++ 里 VBO + glVertexAttribPointer 传入
-in vec3 inPosition;   // 顶点位置（本工程里是经投影后的裁剪空间附近坐标）
-in vec2 inUV;         // 顶点对应的纹理坐标 (0~1)，用于在相机纹理上取样
+// 顶点属性：Shader::drawModel 内上传至 VBO/EBO（VAO 记录布局），再 glDrawElements
+in vec3 inPosition;   // 局部空间（背景：单位四边形 ±1；人物框：单位四边形 ±1）
+in vec2 inUV;         // 纹理坐标 (0~1)
 
-// uniform：整张画面共用一个值的变量，由 C++ 的 glUniform* 设置
-uniform mat4 uProjection; // 旋转等变换矩阵，把 inPosition 变到最终位置
+uniform mat4 uModel;
+uniform mat4 uView;
+uniform mat4 uProjection;
 
-// out：输出给「片元着色器」的同名 in（这里是插值后的 fragUV）
 out vec2 fragUV;
 
 void main() {
-    // 把当前顶点的 UV 原样交给后面；三角形内部的像素会得到插值后的 UV
     fragUV = inUV;
-    // gl_Position 必须是 vec4，固定表示该顶点在裁剪空间的位置（GPU 再自己做透视除法、视口变换）
-    gl_Position = uProjection * vec4(inPosition, 1.0);
+    gl_Position = uProjection * uView * uModel * vec4(inPosition, 1.0);
 }
 )vertex";
 
@@ -48,9 +87,22 @@ uniform sampler2D uTexture; // 绑定到纹理单元上的相机画面（RGBA）
 // 由 C++ 传入 (0或1, 0或1)：为 1 时在对应轴做镜像，修正竖屏预览方向/后置镜像
 uniform vec2 uTexFlip;
 
+// 0：整面采样相机纹理；1：仅绘制空心边框（内部 discard，透出已画的画面）
+uniform int uOverlayMode;
+// 边框在局部 UV [0,1] 空间内的半线宽（距最近边的距离小于此值则画红边）
+uniform float uBorderUv;
+
 out vec4 outColor; // 输出到帧缓冲的颜色 (RGBA)
 
 void main() {
+    if (uOverlayMode != 0) {
+        float d = min(min(fragUV.x, 1.0 - fragUV.x), min(fragUV.y, 1.0 - fragUV.y));
+        if (d > uBorderUv) {
+            discard;
+        }
+        outColor = vec4(1.0, 0.0, 0.0, 1.0);
+        return;
+    }
     // mix(a, b, t) = a*(1-t)+b*t：t 为 0 保持原 UV，为 1 则变成 1-uv，即沿该轴翻转取样
     vec2 uv = vec2(
         mix(fragUV.x, 1.0 - fragUV.x, uTexFlip.x),
@@ -108,13 +160,11 @@ void Renderer::render() {
         cameraDataUpdated_ = false;
     }
 
+    // 2. 绘制相机纹理
     if (shader_ && cameraTexture_ != 0) {
         shader_->activate();
 
-        // 设置纹理单元
-        GLint texLoc = glGetUniformLocation(shader_->getProgram(), "uTexture");
-        glUniform1i(texLoc, 0);
-
+ //--------非必要代码--------       
         // 竖屏(90/270)：需修正 GL 行序(Y) + 后置摄像头预览左右镜像(X)。横屏(0/180)：仅旋转即可，再全局翻 Y 会上下颠倒
         const bool portraitRotation =
                 cameraRotation_ == 90 || cameraRotation_ == 270;
@@ -131,15 +181,20 @@ void Renderer::render() {
         }
         float cosA = cosf(angleRad);
         float sinA = sinf(angleRad);
+//--------非必要代码--------      
 
-        float rotationMatrix[16] = {
+        float viewMatrix[16] = {
             cosA,  sinA, 0, 0,
             -sinA, cosA, 0, 0,
             0,     0,    1, 0,
             0,     0,    0, 1
         };
 
-        shader_->setProjectionMatrix(rotationMatrix);
+        float projMatrix[16];// mvp
+        identityMat4(projMatrix);// mvp
+
+        shader_->setProjectionMatrix(projMatrix);// mvp
+        shader_->setViewMatrix(viewMatrix);// mvp
 
         // 按「旋转后的」逻辑宽高比做 contain，避免竖屏时被拉成正方形
         float sa = width_ > 0 && height_ > 0 ? (float)width_ / (float)height_ : 1.0f;
@@ -155,16 +210,36 @@ void Renderer::render() {
             sy = sa / ia;
         }
 
+        /*
         std::vector<Vertex> bgVerts = {
             Vertex(Vector3{ sx,  sy, 0.0f}, Vector2{1.0f, 0.0f}),
             Vertex(Vector3{-sx,  sy, 0.0f}, Vector2{0.0f, 0.0f}),
             Vertex(Vector3{-sx, -sy, 0.0f}, Vector2{0.0f, 1.0f}),
             Vertex(Vector3{ sx, -sy, 0.0f}, Vector2{1.0f, 1.0f})
+         };
+        */
+        // 局部空间单位四边形，缩放由 uModel（contain）承担
+        std::vector<Vertex> bgVerts = {
+            Vertex(Vector3{ 1.0f,  1.0f, 0.0f}, Vector2{1.0f, 0.0f}),
+            Vertex(Vector3{-1.0f,  1.0f, 0.0f}, Vector2{0.0f, 0.0f}),
+            Vertex(Vector3{-1.0f, -1.0f, 0.0f}, Vector2{0.0f, 1.0f}),
+            Vertex(Vector3{ 1.0f, -1.0f, 0.0f}, Vector2{1.0f, 1.0f})
         };
         std::vector<Index> indices = {0, 1, 2, 0, 2, 3};
 
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, cameraTexture_);
+        float modelBg[16];
+        scaleMat4(modelBg, sx, sy, 1.0f);
+        shader_->setModelMatrix(modelBg);// mvp
+
+        // 设置shader的uTexture
+        GLint texLoc = glGetUniformLocation(shader_->getProgram(), "uTexture");
+        glUniform1i(texLoc, 0);//绑定纹理单元0到uTexture
+        GLint overlayModeLoc = glGetUniformLocation(shader_->getProgram(), "uOverlayMode");
+        if (overlayModeLoc >= 0) {
+            glUniform1i(overlayModeLoc, 0);
+        }
+        glActiveTexture(GL_TEXTURE0);// 激活纹理单元0
+        glBindTexture(GL_TEXTURE_2D, cameraTexture_);// 根据当前active的纹理单元，绑定纹理
 
         Model bgModel(bgVerts, indices, nullptr);
         shader_->drawModel(bgModel);
@@ -175,12 +250,32 @@ void Renderer::render() {
             float y = 1.0f - personY_ * 2.0f;
             float w = personW_;
             float h = personH_;
+            /*
             std::vector<Vertex> boxVerts = {
                 Vertex(Vector3{x+w, y+h, 0.1f}, Vector2{1,1}),
                 Vertex(Vector3{x-w, y+h, 0.1f}, Vector2{0,1}),
                 Vertex(Vector3{x-w, y-h, 0.1f}, Vector2{0,0}),
                 Vertex(Vector3{x+w, y-h, 0.1f}, Vector2{1,0})
             };
+            */
+           // uv：(1,1) 右上，(0,1) 左上，(0,0) 左下，(1,0) 右下。
+           // 在 还没乘 uModel 之前，这是 以原点为中心、边长为 2 的正方形（x、y 从 -1 到 1，z 取 0）。
+            std::vector<Vertex> boxVerts = {
+                Vertex(Vector3{ 1.0f,  1.0f, 0.0f}, Vector2{1, 1}),
+                Vertex(Vector3{-1.0f,  1.0f, 0.0f}, Vector2{0, 1}),
+                Vertex(Vector3{-1.0f, -1.0f, 0.0f}, Vector2{0, 0}),
+                Vertex(Vector3{ 1.0f, -1.0f, 0.0f}, Vector2{1, 0})
+            };
+            float modelBox[16];
+            modelBoxMat4(modelBox, x, y, 0.1f, w, h);
+            shader_->setModelMatrix(modelBox);
+            if (overlayModeLoc >= 0) {
+                glUniform1i(overlayModeLoc, 1);
+            }
+            GLint borderUvLoc = glGetUniformLocation(shader_->getProgram(), "uBorderUv");
+            if (borderUvLoc >= 0) {
+                glUniform1f(borderUvLoc, 0.06f);
+            }
             Model boxModel(boxVerts, indices, nullptr);
             shader_->drawModel(boxModel);
         }
@@ -244,7 +339,11 @@ void Renderer::initRenderer() {
     display_ = display;
 
     // 加载 Shader 并捕获可能的错误
-    shader_ = std::unique_ptr<Shader>(Shader::loadShader(cameraVertex, cameraFragment, "inPosition", "inUV", "uProjection"));
+    shader_ = std::unique_ptr<Shader>(Shader::loadShader(
+            cameraVertex, cameraFragment, "inPosition", "inUV", 
+            "uModel", // mvp
+            "uView", // mvp
+            "uProjection"));// mvp
     if (!shader_) {
         aout << "Shader compilation FAILED!" << std::endl;
     } else {

@@ -49,6 +49,10 @@ public:
         return indices_.size();
     }
 
+    inline size_t getVertexCount() const {
+        return vertices_.size();
+    }
+
     inline const Index *getIndexData() const {
         return indices_.data();
     }

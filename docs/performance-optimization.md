@@ -1,6 +1,7 @@
 # 相机预览与目标检测性能优化说明
 
-> **当前工程状态**：已回退为 **`DnnDetector::detectAndDraw`** 在 RGBA 上绘制框与文字，再经 `updateCameraFrame` 上传纹理；下文中的 `detectOnly`、OpenGL 线框叠加、`DetectionTypes.h` 等路径**已不再存在于代码中**，仅作历史记录。
+> **当前工程状态**：已回退为 **`DnnDetector::detectAndDraw`** 在 RGBA 上绘制框与文字，再经 `updateCameraFrame` 上传纹理；下文中的 `detectOnly`、OpenGL 线框叠加、`DetectionTypes.h` 等路径**已不再存在于代码中**，仅作历史记录。  
+> **图形**：`Shader::drawModel` 已改为 **VAO + VBO + EBO**，每帧 `glBufferData(GL_STREAM_DRAW)` 上传顶点/索引（见下文「顶点绘制」一节）。
 
 本文记录针对「手持移动时画面刷新卡顿」所做的优化思路与实现要点。
 
@@ -58,14 +59,31 @@
 
 - 先 `detectOnly`（只读），再 `updateCameraFrame`（拷贝纯画面到渲染缓冲），最后 `setDetectionOverlay`，保证上传纹理为未污染的相机内容，框仅由 GL 叠加。
 
+### 7. 顶点绘制：VBO + VAO + EBO（`Shader`，已实现）
+
+- **动机**  
+  - OpenGL ES **3.0** 要求顶点属性来自 **缓冲对象**；原先将 `Model` 里 `std::vector` 的 **CPU 指针**直接传给 `glVertexAttribPointer`，属于客户端数组风格，规范上不推荐，部分设备依赖驱动宽松行为。  
+  - 使用 **VBO / EBO** 后，顶点与索引由 GL 管理，数据可置于 **更利于 GPU 取用的存储**，与桌面/移动图形栈惯例一致。
+
+- **实现要点**（`app/src/main/cpp/Shader.{h,cpp}`）  
+  - `loadShader` 链结成功后调用 **`initBufferObjects()`**：`glGenVertexArrays`、`glGenBuffers`（VBO + EBO），在 **VAO** 绑定下配置 `glVertexAttribPointer`（含 `offsetof(Vertex, uv)`）与 `glEnableVertexAttribArray`。  
+  - **`drawModel`**：绑定 VAO → `glBindBuffer(GL_ARRAY_BUFFER)` + **`glBufferData(..., GL_STREAM_DRAW)`** 上传顶点 → `glBindBuffer(GL_ELEMENT_ARRAY_BUFFER)` + **`glBufferData`** 上传索引 → **`glDrawElements(..., GL_UNSIGNED_SHORT, (void*)0)`**。  
+  - 绘制结束后 **`glBindVertexArray(0)`**，且避免在 **仍绑定 VAO** 时把 `GL_ELEMENT_ARRAY_BUFFER` 绑为 0，以免清除 VAO 内保存的 EBO 绑定。  
+  - `Model` 增加 **`getVertexCount()`**，用于计算顶点缓冲字节数。
+
+- **性能说明**  
+  - 当前仍为 **每帧整段 `glBufferData`**（`GL_STREAM_DRAW`），与「每帧从 CPU 内存参与绘制」相比，主要收益是 **路径规范、状态清晰**；CPU→GPU 上传量与调用频率与此前「临时 `Model` + 客户端指针」同量级。  
+  - **后续可优化**：对 **不变的全屏四边形** 使用 **静态 VBO**（仅首次或尺寸变化时上传）；人物框等动态几何可用 **`glBufferSubData`** 或 **顶点着色器 + uniform** 减少每帧上传。
+
 ## 涉及文件（便于维护）
 
 | 区域 | 文件 |
 |------|------|
-| 归一化检测框结构 | `app/src/main/cpp/DetectionTypes.h` |
-| DNN 仅推理 | `app/src/main/cpp/DnnDetector.{h,cpp}` |
-| GL 线框 + 纹理子图上传 | `app/src/main/cpp/Renderer.{h,cpp}` |
-| JNI 顺序与 overlay | `app/src/main/cpp/main.cpp` |
+| 归一化检测框结构 | `app/src/main/cpp/DetectionTypes.h`（历史方案；当前工程已删除） |
+| DNN 仅推理 | `app/src/main/cpp/DnnDetector.{h,cpp}`（历史 `detectOnly` 描述；当前为 `detectAndDraw` + Worker 等，以源码为准） |
+| GL 线框 + 纹理子图上传 | `app/src/main/cpp/Renderer.{h,cpp}`（历史 GL 线框；当前主要为相机纹理 + CPU 画框） |
+| VAO / VBO / EBO 绘制 | `app/src/main/cpp/Shader.{h,cpp}`、`app/src/main/cpp/Model.h` |
+| JNI 顺序与 overlay | `app/src/main/cpp/main.cpp`（当前为 `detectAndDraw` → `updateCameraFrame`，无 overlay） |
 | 分辨率与 Buffer 拷贝 | `app/src/main/java/.../MainActivity.java` |
 
 ---
